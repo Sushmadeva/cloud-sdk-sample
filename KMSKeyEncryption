@@ -1,0 +1,211 @@
+
+package com.ford.mlops.service.impl;
+
+import com.google.cloud.kms.v1.*;
+import com.google.cloud.kms.v1.PublicKey;
+import com.google.protobuf.ByteString;
+import lombok.NoArgsConstructor;
+import net.minidev.json.JSONObject;
+import net.minidev.json.parser.JSONParser;
+import net.minidev.json.parser.ParseException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.stereotype.Service;
+
+import javax.crypto.*;
+import javax.crypto.spec.OAEPParameterSpec;
+import javax.crypto.spec.PBEKeySpec;
+import javax.crypto.spec.PSource;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
+import java.io.StringReader;
+import java.nio.charset.StandardCharsets;
+import java.security.*;
+import java.security.interfaces.RSAPrivateCrtKey;
+import java.security.spec.*;
+import java.util.Base64;
+import java.util.stream.Collectors;
+
+@Service
+@NoArgsConstructor
+@Configuration
+public class KMSKeyEncryption {
+
+    private static final Logger logger = LoggerFactory.getLogger(CloudKMSKeyEncryption.class);
+    String plaintext ="mlopsplatform";
+    byte[] ciphertext = null;
+
+    @Value("spring.cloud.gcp.credentials.location")
+    String jsonPath;
+
+    @Value("mlopsplatform")
+    String password;
+
+
+    // Encrypt data with a given key.
+    public byte[] encryptSymmetric(String projectId, String locationId,
+                                 String keyRingId,String keyId, byte[] bytes) throws IOException, NoSuchPaddingException, NoSuchAlgorithmException, InvalidKeySpecException, InvalidAlgorithmParameterException, InvalidKeyException, IllegalBlockSizeException, BadPaddingException {
+        // Initialize client that will be used to send requests. This client only
+        // needs to be created once, and can be reused for multiple requests. After
+        // completing all of your requests, call the "close" method on the client to
+        // safely clean up any remaining background resources.
+        try (KeyManagementServiceClient client = KeyManagementServiceClient.create()) {
+            // Build the key version name from the project, location, key ring, key,
+            // and key version.
+            CryptoKeyName keyVersionName = CryptoKeyName.of(projectId, locationId, keyRingId, keyId);
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            // Generate the random salt
+            SecureRandom sr = SecureRandom.getInstance("SHA1PRNG");;
+            byte[] salt = new byte[16];
+            sr.nextBytes(salt);
+            // Passing the salt to the digest for the computation
+            md.update(salt);
+
+            SecretKey key =this.getAESKeyFromPassword(keyVersionName.toString(),salt);
+            Cipher cipher = Cipher.getInstance("AES/ECB/PKCS5Padding");
+            cipher.init(Cipher.ENCRYPT_MODE,key,sr);
+            ciphertext = cipher.doFinal(bytes);
+            logger.info(cipher.toString());
+            return ciphertext;
+        }
+
+    }
+    public  SecretKey getAESKeyFromPassword(String password, byte[] salt)
+            throws NoSuchAlgorithmException, InvalidKeySpecException {
+
+        SecretKeyFactory factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+        // iterationCount = 65536
+        // keyLength = 256
+        KeySpec spec = new PBEKeySpec(password.toCharArray(), salt, 65536, 256);
+        SecretKey secret = new SecretKeySpec(factory.generateSecret(spec).getEncoded(), "AES");
+        return secret;
+    }
+
+     // Encrypt data that was encrypted using the public key component of the given
+    // key version.
+    public byte[] encryptAsymmetric(
+            String projectId,
+            String locationId,
+            String keyRingId,
+            String keyId,
+            String keyVersionId,
+            byte[] bytes)
+            throws IOException, GeneralSecurityException {
+        byte[] ciphertext = new byte[2048];
+        // Initialize client that will be used to send requests. This client only
+        // needs to be created once, and can be reused for multiple requests. After
+        // completing all of your requests, call the "close" method on the client to
+        // safely clean up any remaining background resources.
+        try (KeyManagementServiceClient client = KeyManagementServiceClient.create()) {
+            // Build the key version name from the project, location, key ring, key,
+            // and key version.
+            CryptoKeyVersionName keyVersionName =
+                    CryptoKeyVersionName.of(projectId, locationId, keyRingId, keyId, keyVersionId);
+
+            // Get the public key.
+            PublicKey publicKey = client.getPublicKey(keyVersionName);
+
+            // Convert the public PEM key to a DER key (see helper below).
+            byte[] derKey = convertPemToDer(publicKey.getPem());
+            X509EncodedKeySpec keySpec = new X509EncodedKeySpec(derKey);
+            java.security.PublicKey rsaKey = KeyFactory.getInstance("RSA").generatePublic(keySpec);
+
+            // Encrypt plaintext for the 'RSA_DECRYPT_OAEP_2048_SHA256' key.
+            // For other key algorithms:
+            // https://docs.oracle.com/javase/7/docs/api/javax/crypto/Cipher.html
+            Cipher cipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+            OAEPParameterSpec oaepParams =
+                    new OAEPParameterSpec(
+                            "SHA-256", "MGF1", MGF1ParameterSpec.SHA256, PSource.PSpecified.DEFAULT);
+            cipher.init(Cipher.ENCRYPT_MODE, rsaKey, oaepParams);
+            ciphertext = cipher.doFinal(plaintext.getBytes(StandardCharsets.UTF_8));
+            System.out.printf("Ciphertext: %s%n", ciphertext);
+            return ciphertext;
+        }
+
+    }
+
+    // Converts a base64-encoded PEM certificate like the one returned from Cloud
+    // KMS into a DER formatted certificate for use with the Java APIs.
+    private byte[] convertPemToDer(String pem) {
+        BufferedReader bufferedReader = new BufferedReader(new StringReader(pem));
+        String encoded =
+                bufferedReader
+                        .lines()
+                        .filter(line -> !line.startsWith("-----BEGIN") && !line.startsWith("-----END"))
+                        .collect(Collectors.joining());
+        return Base64.getDecoder().decode(encoded);
+    }
+    // Decrypt data that was encrypted using the public key component of the given
+    // key version.
+    public void decryptAsymmetric(
+            String projectId,
+            String locationId,
+            String keyRingId,
+            String keyId,
+            String keyVersionId,
+            byte[] ciphertext)
+            throws IOException {
+        logger.info("Entered Decrypt Code....");
+        // Initialize client that will be used to send requests. This client only
+        // needs to be created once, and can be reused for multiple requests. After
+        // completing all of your requests, call the "close" method on the client to
+        // safely clean up any remaining background resources.
+        try (KeyManagementServiceClient client = KeyManagementServiceClient.create()) {
+            // Build the key version name from the project, location, key ring, key,
+            // and key version.
+            logger.info("Entered decryptAsymmetric Code....0");
+            CryptoKeyVersionName keyVersionName =
+                    CryptoKeyVersionName.of(projectId, locationId, keyRingId, keyId, keyVersionId);
+            logger.info("Entered decryptAsymmetric Code....1" +keyVersionName);
+            // Decrypt the ciphertext.
+            AsymmetricDecryptResponse response =
+                    client.asymmetricDecrypt(keyVersionName, ByteString.copyFrom(ciphertext));
+            logger.info("Plaintext: %s%n", response.getPlaintext().toStringUtf8());
+        }
+    }
+    /**
+     * Encrypts the given plaintext using the specified crypto key.
+     */
+    public byte[] encrypt(
+            String projectId, String locationId, String keyRingId, String cryptoKeyId, byte[] plaintext)
+            throws IOException {
+        logger.info("Entered encrypt....Step0");
+        try (KeyManagementServiceClient client = KeyManagementServiceClient.create()) {
+            logger.info("Entered encrypt.... Step1");
+            // The resource name of the cryptoKey
+            String resourceName = CryptoKeyName.format(projectId, locationId, keyRingId, cryptoKeyId);
+            logger.info("Entered encrypt....Step 2");
+            // Encrypt the plaintext with Cloud KMS.
+            EncryptResponse response = client.encrypt(resourceName, ByteString.copyFrom(plaintext));
+            // Extract the ciphertext from the response.
+            return response.getCiphertext().toByteArray();
+        }
+    }
+
+    /**
+     * Decrypts the provided ciphertext with the specified crypto key.
+     */
+    public byte[] decrypt(
+            String projectId, String locationId, String keyRingId, String cryptoKeyId, byte[] ciphertext)
+            throws IOException {
+        logger.info("Entered decrypt Code....");
+        // Create the KeyManagementServiceClient using try-with-resources to manage client cleanup.
+        try (KeyManagementServiceClient client = KeyManagementServiceClient.create()) {
+            logger.info("Entered decrypt Code....0");
+            // The resource name of the cryptoKey
+            String resourceName = CryptoKeyName.format(projectId, locationId, keyRingId, cryptoKeyId);
+            logger.info("Entered decrypt Code....1  :"+resourceName);
+            // Decrypt the ciphertext with Cloud KMS.
+            DecryptResponse response = client.decrypt(resourceName, ByteString.copyFrom(ciphertext));
+            // Extract the plaintext from the response.
+            return response.getPlaintext().toByteArray();
+        }
+    }
+
+
+}
