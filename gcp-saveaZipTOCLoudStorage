@@ -1,0 +1,35 @@
+public String saveArtifactZiptoStorage (File file) throws IOException {
+
+        String prefix ="-";
+        Storage storage = this.getStorage();
+        try {
+
+            BlobId blobId = BlobId.of(BUCKET_NAME, formatter.format(instance) + "_" + file.getName());
+            BlobInfo blobInfo = BlobInfo.newBuilder(blobId).setContentType("application/gzip").build();
+           // uploadToStorage(storage, file, blobInfo);
+            if (file.length() < 1_000_000) {
+                byte[] bytes = Files.readAllBytes(file.toPath());
+                              
+                            Blob blob = storage.create(blobInfo, encryptedBytes);
+
+                return blob.getMediaLink();
+            }
+            // For big files:
+            // When content is not available or large (1MB or more) it is recommended to write it in chunks via the blob's channel writer.
+            try (WriteChannel writer = storage.writer(blobInfo)) {
+
+                byte[] buffer = new byte[10_240];
+                try (InputStream input = Files.newInputStream(file.toPath())) {
+                    int limit;
+                    while ((limit = input.read(buffer)) >= 0) {
+                        writer.write(ByteBuffer.wrap(buffer, 0, limit));
+                    }
+                }
+            }
+        
+            return blobInfo.getMediaLink(); // Return file url
+        }catch(IllegalStateException | IOException | GeneralSecurityException e){
+            throw new RuntimeException(e);
+
+        }
+    }
